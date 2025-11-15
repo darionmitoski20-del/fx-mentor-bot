@@ -357,20 +357,14 @@ async def cmd_check(m: Message):
     rez = await ai_check_setup(data, zones)
     await m.answer(rez)
 
-@dp.message(Command("chart"))
+@dp.message()
 async def cmd_chart(m: Message):
-    """
-    /chart команда за анализа на chart screenshot.
+    # 1) Проверка дали поракава е за /chart воопшто
+    raw_text = (m.text or m.caption or "").strip().lower()
+    if not raw_text.startswith("/chart"):
+        return
 
-    КОРИСНИК:
-    - испраќа слика од чарт
-    - во caption пишува нешто како:
-      /chart
-      pair: BTCUSD
-      tf: H1
-      bias: long
-      plan: гледам uptrend, можен retest...
-    """
+    # 2) Ако нема слика, врати инструкции
     if not m.photo:
         await m.answer(
             "За анализа на чарт, испрати screenshot како фотографија и во caption напиши, на пример:\n\n"
@@ -382,7 +376,7 @@ async def cmd_chart(m: Message):
         )
         return
 
-    # земаме најголема верзија на сликата
+    # 3) Земаме најголема верзија на сликата
     file_id = m.photo[-1].file_id
     file = await bot.get_file(file_id)
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
@@ -396,6 +390,7 @@ async def cmd_chart(m: Message):
     except Exception as e:
         print("Chart analysis error:", e)
         await m.answer("Настана грешка при анализа на чартот. Провери дали сликата е јасна и пробај повторно.")
+
 
 
 # ============================
