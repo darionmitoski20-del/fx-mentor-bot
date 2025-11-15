@@ -229,6 +229,45 @@ TP: {check['tp']}
 
     return r.output[0].content[0].text
 
+async def ai_analyze_chart_image(image_url: str, caption: str) -> str:
+    """
+    Анализа на chart слика + текст од caption.
+    """
+    prompt = (
+        "Ти си FX/crypto price action ментор.\n"
+        "Корисникот ти праќа screenshot од чарт и кратко објаснување во caption.\n"
+        "Твојата задача е:\n"
+        "1) Да кажеш каков е приближно трендот (горе/долу/sideways) според чарот.\n"
+        "2) Да опишеш важни зони (support/resistance, demand/supply), без да измислуваш точни цени.\n"
+        "3) Да поврзеш со тоа што корисникот го пишал во caption (pair, TF, bias, план).\n"
+        "4) Да предложиш потенцијално сценарио ОД ОКОЛУ (пример: ако bias е long, што би чекал: retest, break, "
+        "confirmation на помал TF…), но без директни сигнали за влез.\n"
+        "5) Да укажеш на ризици (fake break, слаба структура, нема јасен тренд итн.).\n"
+        "6) Сè да биде едукативно, јасно и на македонски.\n\n"
+        f"Caption од корисникот:\n{caption}\n\n"
+        "Одговори во неколку јасни секции: Тренд, Зони, Идеи, Ризици.\n"
+        "Не давај директни наредби за влез/излез, само објаснувај логика."
+    )
+
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": {"url": image_url},
+                    },
+                ],
+            }
+        ],
+    )
+
+    return response.output[0].content[0].text
+
+
 # ============================
 # TELEGRAM COMMANDS
 # ============================
@@ -317,6 +356,47 @@ async def cmd_check(m: Message):
 
     rez = await ai_check_setup(data, zones)
     await m.answer(rez)
+
+@dp.message(Command("chart"))
+async def cmd_chart(m: Message):
+    """
+    /chart команда за анализа на chart screenshot.
+
+    КОРИСНИК:
+    - испраќа слика од чарт
+    - во caption пишува нешто како:
+      /chart
+      pair: BTCUSD
+      tf: H1
+      bias: long
+      plan: гледам uptrend, можен retest...
+    """
+    if not m.photo:
+        await m.answer(
+            "За анализа на чарт, испрати screenshot како фотографија и во caption напиши, на пример:\n\n"
+            "/chart\n"
+            "pair: BTCUSD\n"
+            "tf: H1\n"
+            "bias: long\n"
+            "plan: гледам uptrend, можен retest на зона"
+        )
+        return
+
+    # земаме најголема верзија на сликата
+    file_id = m.photo[-1].file_id
+    file = await bot.get_file(file_id)
+    file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+    caption = m.caption or ""
+    await m.answer("⏳ Го читам чартот, секундна...")
+
+    try:
+        analysis = await ai_analyze_chart_image(file_url, caption)
+        await m.answer(analysis)
+    except Exception as e:
+        print("Chart analysis error:", e)
+        await m.answer("Настана грешка при анализа на чартот. Провери дали сликата е јасна и пробај повторно.")
+
 
 # ============================
 # PRICE WATCHER (background)
