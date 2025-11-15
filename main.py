@@ -1,164 +1,148 @@
-import asyncio
 import os
-import re
-from dataclasses import dataclass, field
+import logging
 from typing import Dict, Optional, Tuple
 
-import httpx
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
+from aiogram import Bot, Dispatcher, executor, types
 from aiogram.types import Message
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiohttp import web
-from dotenv import load_dotenv
+
 from openai import OpenAI
 
-# ============================
-# CONFIG
-# ============================
+# -------------------------------------------------
+#  CONFIG & GLOBALS
+# -------------------------------------------------
 
-load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not TWELVEDATA_API_KEY:
-    raise RuntimeError("BOT_TOKEN, OPENAI_API_KEY или TWELVEDATA_API_KEY недостигаат.")
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN env var")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-PAIR_SYMBOLS = {
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "XAUUSD": "XAU/USD",
-    "BTCUSD": "BTC/USD",
-    "AUDUSD": "AUD/USD",
-    "USDJPY": "USD/JPY",
-}
+# webhook (Render)
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_EXTERNAL_URL and not RENDER_EXTERNAL_URL.startswith("http"):
+    RENDER_EXTERNAL_URL = "https://" + RENDER_EXTERNAL_URL
 
-WATCH_INTERVAL_SECONDS = 60
+WEBHOOK_HOST = RENDER_EXTERNAL_URL or f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', '')}"
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = (WEBHOOK_HOST + WEBHOOK_PATH) if WEBHOOK_HOST else None
 
-# ============================
-# DATA STRUCTURES
-# ============================
+WEBAPP_HOST = "0.0.0.0"
+WEBAPP_PORT = int(os.getenv("PORT", 10000))
 
-@dataclass
-class Zone:
-    pair: str
-    bias: str
-    upper_zone: Optional[Tuple[float, float]] = None
-    lower_zone: Optional[Tuple[float, float]] = None
-    note: str = ""
+# Во меморија ги чуваме плановите по user_id
+USER_PLANS: Dict[int, Dict] = {}
 
-@dataclass
-class UserState:
-    zones: Dict[str, Zone] = field(default_factory=dict)
 
-USERS: Dict[int, UserState] = {}
+# -------------------------------------------------
+#  HELPER FUNKCIJI
+# -------------------------------------------------
 
-def get_user_state(user_id: int) -> UserState:
-    if user_id not in USERS:
-        USERS[user_id] = UserState()
-    return USERS[user_id]
 
-# ============================
-# HELPERS
-# ============================
+def parse_plan(text: str) -> Optional[Dict]:
+    """
+    Очекуваме формат, на пример:
 
-def parse_range(text: str) -> Optional[Tuple[float, float]]:
-    m = re.match(r"\s*([0-9\.]+)\s*-\s*([0-9\.]+)\s*", text)
-    if not m:
+    /plan
+    pair: EURUSD
+    bias: short
+    upper_zone: 1.0850-1.0870
+    lower_zone: 1.0760-1.0780
+    rr: 1:2
+    reason: нешто...
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # првата линија е /plan
+    lines = [l for l in lines if not l.lower().startswith("/plan")]
+
+    data = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        data[key] = val
+
+    required = ["pair", "bias", "upper_zone", "lower_zone"]
+    if not all(k in data for k in required):
         return None
-    a = float(m.group(1))
-    b = float(m.group(2))
-    return (min(a, b), max(a, b))
-
-def parse_plan(text: str) -> dict:
-    def find(key):
-        m = re.search(rf"{key}\s*:\s*(.+)", text, re.IGNORECASE)
-        return m.group(1).strip() if m else None
-
-    pair = (find("pair") or "").upper().replace("/", "")
-    bias = (find("bias") or "").lower()
-    upper_zone = parse_range(find("upper_zone") or "")
-    lower_zone = parse_range(find("lower_zone") or "")
-    rr = find("rr") or ""
-    reason = find("reason") or ""
 
     return {
-        "pair": pair,
-        "bias": bias,
-        "upper_zone": upper_zone,
-        "lower_zone": lower_zone,
-        "rr": rr,
-        "reason": reason,
+        "pair": data["pair"].upper(),
+        "bias": data["bias"].lower(),
+        "upper_zone": data["upper_zone"],
+        "lower_zone": data["lower_zone"],
+        "rr": data.get("rr", "1:2"),
+        "reason": data.get("reason", ""),
     }
 
-def parse_check(text: str) -> dict:
-    def find(key):
-        m = re.search(rf"{key}\s*:\s*([A-Za-z0-9\.\-]+)", text, re.IGNORECASE)
-        return m.group(1).strip() if m else None
 
-    def ffloat(v):
-        try:
-            return float(v)
-        except:
-            return None
+def parse_check(text: str) -> Optional[Dict]:
+    """
+    /check
+    pair: EURUSD
+    direction: short
+    entry: 1.0860
+    sl: 1.0880
+    tp: 1.0820
+    reason: ...
+    """
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    lines = [l for l in lines if not l.lower().startswith("/check")]
 
-    pair = (find("pair") or "").upper().replace("/", "")
-    direction = (find("direction") or "").lower()
-    entry = ffloat(find("entry"))
-    sl = ffloat(find("sl"))
-    tp = ffloat(find("tp"))
+    data = {}
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip()
+        data[key] = val
 
-    m_reason = re.search(r"reason\s*:\s*(.+)", text, re.IGNORECASE)
-    reason = m_reason.group(1).strip() if m_reason else ""
+    required = ["pair", "direction", "entry", "sl", "tp"]
+    if not all(k in data for k in required):
+        return None
+
+    try:
+        entry = float(data["entry"].replace(",", "."))
+        sl = float(data["sl"].replace(",", "."))
+        tp = float(data["tp"].replace(",", "."))
+    except ValueError:
+        return None
 
     return {
-        "pair": pair,
-        "direction": direction,
+        "pair": data["pair"].upper(),
+        "direction": data["direction"].lower(),
         "entry": entry,
         "sl": sl,
         "tp": tp,
-        "reason": reason,
+        "reason": data.get("reason", ""),
     }
 
-def calc_rr(entry, sl, tp):
-    if not entry or not sl or not tp:
-        return None
+
+def calc_rr(entry: float, sl: float, tp: float) -> Optional[Tuple[float, float, float]]:
     risk = abs(entry - sl)
-    reward = abs(entry - tp)
-    if risk == 0:
+    reward = abs(tp - entry)
+    if risk <= 0:
         return None
     return risk, reward, reward / risk
 
-async def fetch_price(symbol: str) -> Optional[float]:
-    try:
-        async with httpx.AsyncClient(timeout=10) as s:
-            r = await s.get(
-                "https://api.twelvedata.com/price",
-                params={"symbol": symbol, "apikey": TWELVEDATA_API_KEY},
-            )
-            data = r.json()
-            if "price" in data:
-                return float(data["price"])
-    except:
-        return None
-    return None
 
-# ============================
-# OPENAI ANALYSIS
-# ============================
-
-async def ai_analyze_plan(plan, text):
+async def ai_analyze_plan(plan: Dict) -> str:
     upper = plan["upper_zone"]
     lower = plan["lower_zone"]
 
     prompt = f"""
-Ти си FX price action ментор. Корисникот е почетник.
+Ти си FX/crypto price action ментор. Корисникот е почетник.
 
 Анализирај го планот:
 - пар: {plan['pair']}
@@ -169,26 +153,28 @@ async def ai_analyze_plan(plan, text):
 - причина: {plan['reason']}
 
 Објасни:
-1) Дали bias има смисла
-2) Како изгледаат зоните теоретски
-3) Каде од ОКОЛУ би имало логични области за entry, SL, TP (без точни цени)
-4) Што е добро и што е ризично
-5) Сè да биде едукативно, НЕ финансиски совет.
+1) Дали bias има логика (теоретски, без да знаеш точни цени).
+2) Како би изгледале овие зони (supply/demand, support/resistance) во нормален чарт.
+3) Како отприлика би размислувал за entry, SL и TP (без да даваш точни цени).
+4) Што е добро во планот и што е потенцијален ризик.
+5) Објаснувај поедноставно, на македонски, како ментор на почетник.
+6) Не давај директен совет: само објаснувај логика.
 """
 
-    r = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {
                 "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
+                "content": prompt,
             }
         ],
     )
 
-    return r.output[0].content[0].text
+    return resp.choices[0].message.content
 
-async def ai_check_setup(check, zone):
+
+async def ai_check_setup(check: Dict, zone: Dict) -> str:
     rr = calc_rr(check["entry"], check["sl"], check["tp"])
     if rr:
         risk, reward, rr_val = rr
@@ -197,7 +183,7 @@ async def ai_check_setup(check, zone):
         rr_line = "Не може да се пресмета RR."
 
     prompt = f"""
-FX ментор: провери го сетапот.
+FX/crypto ментор, провери го следниов сетап.
 
 PAIR: {check['pair']}
 Direction: {check['direction']}
@@ -206,28 +192,32 @@ SL: {check['sl']}
 TP: {check['tp']}
 {rr_line}
 
-Зони од планот:
-{zone}
+План/зони од корисникот:
+- Bias: {zone.get('bias')}
+- Upper zone: {zone.get('upper_zone')}
+- Lower zone: {zone.get('lower_zone')}
+- Reason: {zone.get('reason')}
 
 Објасни:
-- дали насоката има смисла со bias
-- дали SL/TP се поставени логично
-- дали RR е здрав
-- на што да внимава
-- едукативно, без сигнали
+1) Дали насоката (long/short) има смисла со bias.
+2) Дали позицијата на SL и TP изгледа логично во однос на зоните (теоретски).
+3) Дали RR е здрав за еден почетник.
+4) На што би внимава(л) ти, што може да појде наопаку.
+5) Сè на македонски, едукативно, без директни сигнали.
 """
 
-    r = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {
                 "role": "user",
-                "content": [{"type": "input_text", "text": prompt}],
+                "content": prompt,
             }
         ],
     )
 
-    return r.output[0].content[0].text
+    return resp.choices[0].message.content
+
 
 async def ai_analyze_chart_image(image_url: str, caption: str) -> str:
     """
@@ -249,122 +239,161 @@ async def ai_analyze_chart_image(image_url: str, caption: str) -> str:
         "Не давај директни наредби за влез/излез, само објаснувај логика."
     )
 
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
             {
                 "role": "user",
                 "content": [
-                    {"type": "input_text", "text": prompt},
-                    {
-                        "type": "input_image",
-                        "image_url": {"url": image_url},
-                    },
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}},
                 ],
             }
         ],
     )
 
-    return response.output[0].content[0].text
+    return resp.choices[0].message.content
 
 
-# ============================
-# TELEGRAM COMMANDS
-# ============================
+# -------------------------------------------------
+#  TELEGRAM HANDLERS
+# -------------------------------------------------
 
-@dp.message(Command("start"))
+
+@dp.message_handler(commands=["start"])
 async def cmd_start(m: Message):
     await m.answer(
-        "👋 Здраво! FX Mentor Bot е активен.\n\n"
-        "Команди:\n"
-        "/plan – постави зони\n"
-        "/check – провери сетап\n"
-        "/zones – активни зони\n"
-        "/clear – избриши зони\n"
-        "/help – помош\n\n"
-        "Сè е едукативно, не е финансиски совет."
+        "👋 Здраво, јас сум FX Mentor Bot.\n\n"
+        "Можеш да:\n"
+        "• Направиш план со /plan\n"
+        "• Ми пратиш конкретен сетап со /check\n"
+        "• Да ги видиш активните зони со /zones\n"
+        "• Да ги избришеш зоните со /clear\n"
+        "• Да ми пратиш screenshot од чарт со /chart (во caption) за едукативна анализа.\n\n"
+        "Сè е само за учење, НЕ е финансиски совет. 😊"
     )
 
-@dp.message(Command("help"))
+
+@dp.message_handler(commands=["help"])
 async def cmd_help(m: Message):
     await m.answer(
-        "📘 Помош:\n\n"
-        "**/plan**\n"
+        "Еве примери како да ме користиш:\n\n"
+        "📌 /plan пример:\n"
+        "/plan\n"
         "pair: EURUSD\n"
         "bias: short\n"
         "upper_zone: 1.0850-1.0870\n"
         "lower_zone: 1.0760-1.0780\n"
         "rr: 1:2\n"
-        "reason: H4 downtrend\n\n"
-        "**/check**\n"
+        "reason: H4 downtrend, структура надолу\n\n"
+        "📌 /check пример:\n"
+        "/check\n"
         "pair: EURUSD\n"
         "direction: short\n"
         "entry: 1.0860\n"
         "sl: 1.0880\n"
-        "tp: 1.0820",
-        parse_mode="Markdown",
+        "tp: 1.0820\n"
+        "reason: ретест на зона, M15 rejection\n\n"
+        "📌 /chart пример (како caption на слика):\n"
+        "/chart\n"
+        "pair: BTCUSD\n"
+        "tf: H1\n"
+        "bias: long\n"
+        "plan: гледам uptrend, можен retest на зона"
     )
 
-@dp.message(Command("clear"))
-async def cmd_clear(m: Message):
-    USERS[m.from_user.id] = UserState()
-    await m.answer("🧹 Зоните се избришани.")
 
-@dp.message(Command("zones"))
-async def cmd_zones(m: Message):
-    st = get_user_state(m.from_user.id)
-    if not st.zones:
-        return await m.answer("Нема активни зони.")
-
-    msg = "📍 Активни зони:\n"
-    for p, z in st.zones.items():
-        msg += f"\nPAIR: {p}\nBias: {z.bias}\nГорна: {z.upper_zone}\nДолна: {z.lower_zone}\n"
-    await m.answer(msg)
-
-@dp.message(Command("plan"))
+@dp.message_handler(commands=["plan"])
 async def cmd_plan(m: Message):
-    text = m.text
-    plan = parse_plan(text)
-
-    if plan["pair"] not in PAIR_SYMBOLS:
-        return await m.answer("❌ Непознат pair.")
-
-    state = get_user_state(m.from_user.id)
-
-    state.zones[plan["pair"]] = Zone(
-        pair=plan["pair"],
-        bias=plan["bias"],
-        upper_zone=plan["upper_zone"],
-        lower_zone=plan["lower_zone"],
-        note=plan["reason"],
-    )
-
-    await m.answer("⏳ Анализирам...")
-    analysis = await ai_analyze_plan(plan, text)
-    await m.answer(analysis)
-
-@dp.message(Command("check"))
-async def cmd_check(m: Message):
-    text = m.text
-    data = parse_check(text)
-
-    if data["pair"] not in PAIR_SYMBOLS:
-        return await m.answer("❌ Непознат pair.")
-
-    zones = get_user_state(m.from_user.id).zones.get(data["pair"])
-    await m.answer("⏳ Проверувам сетап...")
-
-    rez = await ai_check_setup(data, zones)
-    await m.answer(rez)
-
-@dp.message()
-async def cmd_chart(m: Message):
-    # 1) Проверка дали поракава е за /chart воопшто
-    raw_text = (m.text or m.caption or "").strip().lower()
-    if not raw_text.startswith("/chart"):
+    plan = parse_plan(m.text)
+    if not plan:
+        await m.answer(
+            "Форматот на /plan не е добар.\n"
+            "Пример:\n\n"
+            "/plan\n"
+            "pair: EURUSD\n"
+            "bias: short\n"
+            "upper_zone: 1.0850-1.0870\n"
+            "lower_zone: 1.0760-1.0780\n"
+            "rr: 1:2\n"
+            "reason: H4 downtrend..."
+        )
         return
 
-    # 2) Ако нема слика, врати инструкции
+    USER_PLANS[m.from_user.id] = plan
+
+    await m.answer("✅ Планот е зачуван. Сега ќе направам едукативна анализа...")
+    analysis = await ai_analyze_plan(plan)
+    await m.answer(analysis)
+
+
+@dp.message_handler(commands=["zones"])
+async def cmd_zones(m: Message):
+    plan = USER_PLANS.get(m.from_user.id)
+    if not plan:
+        await m.answer("Немаш активен план. Користи /plan за да внесеш зони.")
+        return
+
+    txt = (
+        f"📌 Активен план:\n\n"
+        f"Pair: {plan['pair']}\n"
+        f"Bias: {plan['bias']}\n"
+        f"Upper zone: {plan['upper_zone']}\n"
+        f"Lower zone: {plan['lower_zone']}\n"
+        f"RR: {plan['rr']}\n"
+        f"Reason: {plan['reason']}"
+    )
+    await m.answer(txt)
+
+
+@dp.message_handler(commands=["clear"])
+async def cmd_clear(m: Message):
+    if m.from_user.id in USER_PLANS:
+        USER_PLANS.pop(m.from_user.id)
+        await m.answer("🧹 Ги избришав сите зони/планови за тебе.")
+    else:
+        await m.answer("Немаш активни зони кои треба да се бришат.")
+
+
+@dp.message_handler(commands=["check"])
+async def cmd_check(m: Message):
+    plan = USER_PLANS.get(m.from_user.id)
+    if not plan:
+        await m.answer("Немаш активен план. Прво користи /plan, па после /check.")
+        return
+
+    check = parse_check(m.text)
+    if not check:
+        await m.answer(
+            "Форматот на /check не е добар.\n"
+            "Пример:\n\n"
+            "/check\n"
+            "pair: EURUSD\n"
+            "direction: short\n"
+            "entry: 1.0860\n"
+            "sl: 1.0880\n"
+            "tp: 1.0820\n"
+            "reason: ретест на зона, M15 rejection"
+        )
+        return
+
+    await m.answer("✅ Го примив сетапот, правам анализа...")
+    analysis = await ai_check_setup(check, plan)
+    await m.answer(analysis)
+
+
+# ---------------  /chart  -------------------------
+
+
+@dp.message_handler(lambda m: (m.caption and m.caption.lower().startswith("/chart")) or (m.text and m.text.lower().startswith("/chart")),
+                    content_types=types.ContentTypes.ANY)
+async def cmd_chart(m: Message):
+    """
+    /chart команда – се користи како caption на слика.
+    """
+    raw_text = (m.caption or m.text or "").strip()
+
+    # ако нема слика, враќаме инструкции
     if not m.photo:
         await m.answer(
             "За анализа на чарт, испрати screenshot како фотографија и во caption напиши, на пример:\n\n"
@@ -376,96 +405,50 @@ async def cmd_chart(m: Message):
         )
         return
 
-    # 3) Земаме најголема верзија на сликата
+    # земаме најголема верзија на сликата
     file_id = m.photo[-1].file_id
     file = await bot.get_file(file_id)
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
 
-    caption = m.caption or ""
+    caption = m.caption or m.text or ""
     await m.answer("⏳ Го читам чартот, секундна...")
 
     try:
         analysis = await ai_analyze_chart_image(file_url, caption)
         await m.answer(analysis)
     except Exception as e:
-        print("Chart analysis error:", e)
-        await m.answer("Настана грешка при анализа на чартот. Провери дали сликата е јасна и пробај повторно.")
+        logging.exception("Chart analysis error: %s", e)
+        await m.answer("❌ Настана грешка при анализа на чартот. Провери дали сликата е јасна и пробај повторно.")
 
 
+# -------------------------------------------------
+#  WEBHOOK START / STOP
+# -------------------------------------------------
 
-# ============================
-# PRICE WATCHER (background)
-# ============================
 
-async def price_watcher():
-    sent = set()
-    while True:
-        try:
-            for uid, st in USERS.items():
-                for pair, z in st.zones.items():
-                    symbol = PAIR_SYMBOLS[pair]
-                    price = await fetch_price(symbol)
-                    if not price:
-                        continue
-
-                    if z.upper_zone:
-                        low, high = z.upper_zone
-                        if low <= price <= high and (uid, pair, "u") not in sent:
-                            await bot.send_message(
-                                uid,
-                                f"📣 {pair} е во ГОРНАТА зона {low}-{high}.\nПровери М15/M5."
-                            )
-                            sent.add((uid, pair, "u"))
-
-                    if z.lower_zone:
-                        low, high = z.lower_zone
-                        if low <= price <= high and (uid, pair, "l") not in sent:
-                            await bot.send_message(
-                                uid,
-                                f"📣 {pair} е во ДОЛНАТА зона {low}-{high}.\nПровери структура."
-                            )
-                            sent.add((uid, pair, "l"))
-
-            await asyncio.sleep(WATCH_INTERVAL_SECONDS)
-        except Exception as e:
-            print("Watcher error:", e)
-            await asyncio.sleep(WATCH_INTERVAL_SECONDS)
-
-# ============================
-# WEBHOOK + AIOHTTP SERVER
-# ============================
-
-PORT = int(os.getenv("PORT", 8000))
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = BASE_URL + WEBHOOK_PATH if BASE_URL else ""
-
-async def on_startup(app: web.Application):
-    # стартува background watcher
-    app["price_watcher"] = asyncio.create_task(price_watcher())
+async def on_startup(dp: Dispatcher):
     if WEBHOOK_URL:
         await bot.set_webhook(WEBHOOK_URL)
-        print("Webhook set to:", WEBHOOK_URL)
+        logging.info(f"Webhook set to: {WEBHOOK_URL}")
     else:
-        print("WARNING: RENDER_EXTERNAL_URL не е поставен.")
+        logging.warning("WEBHOOK_URL не е сетнат (нема RENDER_EXTERNAL_URL)")
 
-async def on_shutdown(app: web.Application):
-    watcher = app.get("price_watcher")
-    if watcher:
-        watcher.cancel()
+
+async def on_shutdown(dp: Dispatcher):
+    logging.warning("Shutting down..")
     await bot.delete_webhook()
+    await bot.session.close()
+    logging.warning("Bye!")
 
-def main():
-    app = web.Application()
-    app["bot"] = bot
-
-    handler = SimpleRequestHandler(dp, bot)
-    handler.register(app, path=WEBHOOK_PATH)
-
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
-
-    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    main()
+    logging.info("Starting webhook bot...")
+    executor.start_webhook(
+        dispatcher=dp,
+        webhook_path=WEBHOOK_PATH,
+        on_startup=on_startup,
+        on_shutdown=on_shutdown,
+        skip_updates=True,
+        host=WEBAPP_HOST,
+        port=WEBAPP_PORT,
+    )
