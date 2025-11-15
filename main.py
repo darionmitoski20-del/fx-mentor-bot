@@ -1,20 +1,17 @@
-# ============================
-# FX Mentor Bot (main.py)
-# ============================
-
 import asyncio
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import httpx
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiohttp import web
 from dotenv import load_dotenv
 from openai import OpenAI
-
 
 # ============================
 # CONFIG
@@ -44,7 +41,6 @@ PAIR_SYMBOLS = {
 
 WATCH_INTERVAL_SECONDS = 60
 
-
 # ============================
 # DATA STRUCTURES
 # ============================
@@ -57,20 +53,16 @@ class Zone:
     lower_zone: Optional[Tuple[float, float]] = None
     note: str = ""
 
-
 @dataclass
 class UserState:
     zones: Dict[str, Zone] = field(default_factory=dict)
 
-
 USERS: Dict[int, UserState] = {}
-
 
 def get_user_state(user_id: int) -> UserState:
     if user_id not in USERS:
         USERS[user_id] = UserState()
     return USERS[user_id]
-
 
 # ============================
 # HELPERS
@@ -84,9 +76,8 @@ def parse_range(text: str) -> Optional[Tuple[float, float]]:
     b = float(m.group(2))
     return (min(a, b), max(a, b))
 
-
 def parse_plan(text: str) -> dict:
-    def find(key): 
+    def find(key):
         m = re.search(rf"{key}\s*:\s*(.+)", text, re.IGNORECASE)
         return m.group(1).strip() if m else None
 
@@ -106,19 +97,19 @@ def parse_plan(text: str) -> dict:
         "reason": reason,
     }
 
-
 def parse_check(text: str) -> dict:
     def find(key):
         m = re.search(rf"{key}\s*:\s*([A-Za-z0-9\.\-]+)", text, re.IGNORECASE)
         return m.group(1).strip() if m else None
 
     def ffloat(v):
-        try: return float(v)
-        except: return None
+        try:
+            return float(v)
+        except:
+            return None
 
     pair = (find("pair") or "").upper().replace("/", "")
     direction = (find("direction") or "").lower()
-
     entry = ffloat(find("entry"))
     sl = ffloat(find("sl"))
     tp = ffloat(find("tp"))
@@ -135,20 +126,21 @@ def parse_check(text: str) -> dict:
         "reason": reason,
     }
 
-
 def calc_rr(entry, sl, tp):
-    if not entry or not sl or not tp: return None
+    if not entry or not sl or not tp:
+        return None
     risk = abs(entry - sl)
     reward = abs(entry - tp)
-    if risk == 0: return None
-    return risk, reward, reward/risk
-
+    if risk == 0:
+        return None
+    return risk, reward, reward / risk
 
 async def fetch_price(symbol: str) -> Optional[float]:
     try:
         async with httpx.AsyncClient(timeout=10) as s:
-            r = await s.get("https://api.twelvedata.com/price",
-                params={"symbol": symbol, "apikey": TWELVEDATA_API_KEY}
+            r = await s.get(
+                "https://api.twelvedata.com/price",
+                params={"symbol": symbol, "apikey": TWELVEDATA_API_KEY},
             )
             data = r.json()
             if "price" in data:
@@ -156,7 +148,6 @@ async def fetch_price(symbol: str) -> Optional[float]:
     except:
         return None
     return None
-
 
 # ============================
 # OPENAI ANALYSIS
@@ -187,12 +178,15 @@ async def ai_analyze_plan(plan, text):
 
     r = client.responses.create(
         model="gpt-4.1-mini",
-        input=[{"role": "user",
-                "content":[{"type":"input_text","text": prompt}]}]
+        input=[
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
     )
 
     return r.output[0].content[0].text
-
 
 async def ai_check_setup(check, zone):
     rr = calc_rr(check["entry"], check["sl"], check["tp"])
@@ -225,12 +219,15 @@ TP: {check['tp']}
 
     r = client.responses.create(
         model="gpt-4.1-mini",
-        input=[{"role": "user",
-                "content":[{"type":"input_text","text": prompt}]}]
+        input=[
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        ],
     )
 
     return r.output[0].content[0].text
-
 
 # ============================
 # TELEGRAM COMMANDS
@@ -249,7 +246,6 @@ async def cmd_start(m: Message):
         "Сè е едукативно, не е финансиски совет."
     )
 
-
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
     await m.answer(
@@ -267,15 +263,13 @@ async def cmd_help(m: Message):
         "entry: 1.0860\n"
         "sl: 1.0880\n"
         "tp: 1.0820",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
-
 
 @dp.message(Command("clear"))
 async def cmd_clear(m: Message):
     USERS[m.from_user.id] = UserState()
     await m.answer("🧹 Зоните се избришани.")
-
 
 @dp.message(Command("zones"))
 async def cmd_zones(m: Message):
@@ -287,7 +281,6 @@ async def cmd_zones(m: Message):
     for p, z in st.zones.items():
         msg += f"\nPAIR: {p}\nBias: {z.bias}\nГорна: {z.upper_zone}\nДолна: {z.lower_zone}\n"
     await m.answer(msg)
-
 
 @dp.message(Command("plan"))
 async def cmd_plan(m: Message):
@@ -311,7 +304,6 @@ async def cmd_plan(m: Message):
     analysis = await ai_analyze_plan(plan, text)
     await m.answer(analysis)
 
-
 @dp.message(Command("check"))
 async def cmd_check(m: Message):
     text = m.text
@@ -326,14 +318,12 @@ async def cmd_check(m: Message):
     rez = await ai_check_setup(data, zones)
     await m.answer(rez)
 
-
 # ============================
-# PRICE WATCHER
+# PRICE WATCHER (background)
 # ============================
 
 async def price_watcher():
     sent = set()
-
     while True:
         try:
             for uid, st in USERS.items():
@@ -343,7 +333,6 @@ async def price_watcher():
                     if not price:
                         continue
 
-                    # upper zone
                     if z.upper_zone:
                         low, high = z.upper_zone
                         if low <= price <= high and (uid, pair, "u") not in sent:
@@ -353,7 +342,6 @@ async def price_watcher():
                             )
                             sent.add((uid, pair, "u"))
 
-                    # lower zone
                     if z.lower_zone:
                         low, high = z.lower_zone
                         if low <= price <= high and (uid, pair, "l") not in sent:
@@ -364,20 +352,45 @@ async def price_watcher():
                             sent.add((uid, pair, "l"))
 
             await asyncio.sleep(WATCH_INTERVAL_SECONDS)
-
         except Exception as e:
             print("Watcher error:", e)
             await asyncio.sleep(WATCH_INTERVAL_SECONDS)
 
-
 # ============================
-# MAIN
+# WEBHOOK + AIOHTTP SERVER
 # ============================
 
-async def main():
-    asyncio.create_task(price_watcher())
-    await dp.start_polling(bot)
+PORT = int(os.getenv("PORT", 8000))
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = BASE_URL + WEBHOOK_PATH if BASE_URL else ""
 
+async def on_startup(app: web.Application):
+    # стартува background watcher
+    app["price_watcher"] = asyncio.create_task(price_watcher())
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        print("Webhook set to:", WEBHOOK_URL)
+    else:
+        print("WARNING: RENDER_EXTERNAL_URL не е поставен.")
+
+async def on_shutdown(app: web.Application):
+    watcher = app.get("price_watcher")
+    if watcher:
+        watcher.cancel()
+    await bot.delete_webhook()
+
+def main():
+    app = web.Application()
+    app["bot"] = bot
+
+    handler = SimpleRequestHandler(dp, bot)
+    handler.register(app, path=WEBHOOK_PATH)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
